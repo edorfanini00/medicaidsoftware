@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { handleRouteError } from "@/lib/api";
+import { handleRouteError, jsonError } from "@/lib/api";
+import { getApiUser } from "@/lib/auth";
 import { applyRemittance } from "@/lib/billing/remittance";
 import { getClearinghouse } from "@/lib/clearinghouse";
 
@@ -8,6 +9,7 @@ import { getClearinghouse } from "@/lib/clearinghouse";
 // from the job queue, not from a user click.
 export async function POST() {
   try {
+    if (!(await getApiUser("ADMIN"))) return jsonError("Admin access required", 403);
     const since = new Date(Date.now() - 1000 * 60 * 60 * 24 * 30);
     const files = await getClearinghouse().fetchRemittances(since);
     const results = [];

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { audit } from "@/lib/audit";
 import { handleRouteError, jsonError } from "@/lib/api";
+import { getApiUser } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 
 const createDoula = z.object({
@@ -16,6 +17,7 @@ const createDoula = z.object({
 });
 
 export async function GET() {
+  if (!(await getApiUser("ADMIN"))) return jsonError("Admin access required", 403);
   const doulas = await prisma.doula.findMany({
     orderBy: { createdAt: "desc" },
     include: { _count: { select: { clients: true, claims: true } } },
@@ -25,6 +27,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    if (!(await getApiUser("ADMIN"))) return jsonError("Admin access required", 403);
     const body = createDoula.parse(await req.json());
     const org = await prisma.organization.findFirst();
     if (!org) return jsonError("No organization configured. Seed or create one first.", 409);

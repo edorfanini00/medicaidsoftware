@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { audit } from "@/lib/audit";
 import { handleRouteError, jsonError } from "@/lib/api";
+import { getApiUser } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 
 const createService = z.object({
@@ -15,17 +16,23 @@ const createService = z.object({
 // later at claim build, from the active StateRuleset.
 export async function POST(req: NextRequest) {
   try {
+    const user = await getApiUser();
+    if (!user) return jsonError("Sign in required", 401);
+
     const body = createService.parse(await req.json());
     const episode = await prisma.careEpisode.findUnique({ where: { id: body.episodeId } });
     if (!episode) return jsonError("Episode not found", 404);
-    if (episode.status !== "ACTIVE") return jsonError("Episode is not active", 409);
+    // Doulas can only log visits for their own families.
+    if (user.role === "DOULA" && episode.doulaId !== user.doulaId) {
+      return jsonError("Not your family", 403);
+    }
+    if (episode.status !== "ACTIVE") return jsonError("This care episode is closed", 409);
 
-    const updates =
-      body.serviceType === "LABOR_DELIVERY" && !episode.actualDeliveryDate
-        ? { actualDeliveryDate: new Date(body.serviceDate) }
-        : undefined;
-    if (updates) {
-      await prisma.careEpisode.update({ where: { id: episode.id }, data: updates });
+    if (body.serviceType === "LABOR_DELIVERY" && !episode.actualDeliveryDate) {
+      await prisma.careEpisode.update({
+        where: { id: episode.id },
+        data: { actualDeliveryDate: new Date(body.serviceDate) },
+      });
     }
 
     const service = await prisma.service.create({
@@ -38,7 +45,8 @@ export async function POST(req: NextRequest) {
       },
     });
     await audit({
-      actorType: "DOULA",
+      actorType: user.role === "DOULA" ? "DOULA" : "USER",
+      actorId: user.id,
       action: "CREATE",
       entityType: "Service",
       entityId: service.id,

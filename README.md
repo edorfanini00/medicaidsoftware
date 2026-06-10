@@ -1,4 +1,15 @@
-# Medicaid Doula Billing System
+# Maren: Medicaid billing for doulas
+
+Three surfaces on one backend:
+
+- **Doula portal** (`/`): calm, plain-language. Families, the care-and-payment journey arc, visit logging, payments. No EDI terms ever cross this boundary (`src/lib/plain.ts` enforces the translation).
+- **Admin control tower** (`/admin`): dense operations. Claims workspace, denials and rework with CARC translations, remittances, reconciliation, eligibility console, payout ledger, reports, payer directory, audit log, state ruleset view.
+- **Client intake** (`/intake/[token]`): a short, trustworthy link-based flow capturing the mother's details, Medicaid ID, and billing consent.
+
+Demo sign-ins (after seeding): `jamie@example.com` (doula) or `admin@example.com` (admin), password `maren-demo`. On a fresh deployment, `POST /api/setup` loads the demo dataset into an empty database.
+
+---
+
 
 A narrow, vertical revenue-cycle-management (RCM) application for doula services billed to Medicaid. The company is the billing provider (organization, Type 2 NPI); doulas operate under it as rendering providers (individual, Type 1 NPI). Medicaid pays the organization, the organization pays the doulas their share minus a fee.
 

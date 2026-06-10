@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { handleRouteError } from "@/lib/api";
+import { handleRouteError, jsonError } from "@/lib/api";
+import { getApiUser } from "@/lib/auth";
 import { buildClaim } from "@/lib/billing/claims";
 import { prisma } from "@/lib/db";
 
@@ -10,6 +11,7 @@ const buildBody = z.object({
 });
 
 export async function GET() {
+  if (!(await getApiUser("ADMIN"))) return jsonError("Admin access required", 403);
   const claims = await prisma.claim.findMany({
     orderBy: { createdAt: "desc" },
     include: {
@@ -24,6 +26,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    if (!(await getApiUser("ADMIN"))) return jsonError("Admin access required", 403);
     const body = buildBody.parse(await req.json());
     const result = await buildClaim(body.episodeId, body.serviceIds);
     if (!result.ok) {

@@ -13,6 +13,79 @@ datasource db {
 }
 
 // ---------------------------------------------------------------------------
+// Identity and access
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         UserRole
+  // Set when the user is a doula; scopes everything they can see.
+  doulaId      String?   @unique
+  doula        Doula?    @relation(fields: [doulaId], references: [id])
+  createdAt    DateTime  @default(now())
+
+  sessions      Session[]
+  notifications Notification[]
+}
+
+enum UserRole {
+  ADMIN
+  DOULA
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+// A shareable intake link a doula sends to a mother. Completing it creates
+// the Client, the CareEpisode, and the consent record.
+model IntakeLink {
+  id        String           @id @default(cuid())
+  token     String           @unique
+  doulaId   String
+  doula     Doula            @relation(fields: [doulaId], references: [id])
+  status    IntakeLinkStatus @default(PENDING)
+  clientId  String?
+  createdAt DateTime         @default(now())
+}
+
+enum IntakeLinkStatus {
+  PENDING
+  COMPLETED
+  EXPIRED
+}
+
+// Authorization to bill on the client's behalf, captured at intake.
+// Append-only: a consent is never edited, only superseded.
+model ConsentRecord {
+  id         String   @id @default(cuid())
+  clientId   String
+  client     Client   @relation(fields: [clientId], references: [id])
+  kind       String // "BILLING_AUTHORIZATION" | state-required forms
+  signedName String
+  consentText String
+  signedAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
 
@@ -92,6 +165,8 @@ model Doula {
   claims   Claim[]
   payouts  Payout[]
   documents DoulaDocument[]
+  user        User?
+  intakeLinks IntakeLink[]
 }
 
 enum DoulaStatus {
@@ -137,6 +212,7 @@ model Client {
 
   episodes          CareEpisode[]
   eligibilityChecks EligibilityCheck[]
+  consents          ConsentRecord[]
 
   @@unique([medicaidId, state])
 }

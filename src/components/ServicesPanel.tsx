@@ -78,7 +78,7 @@ export function ServicesPanel({
       );
     } else {
       const { claimId } = await res.json();
-      router.push(`/claims/${claimId}`);
+      router.push(`/admin/claims/${claimId}`);
     }
   }
 
