@@ -1,0 +1,498 @@
+// Medicaid Doula Billing System - system of record.
+//
+// Money is stored in integer cents. Dates of service are stored as DateTime
+// at UTC midnight. All billing mutations must also write an AuditLog row.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Providers
+// ---------------------------------------------------------------------------
+
+// The billing provider: the company itself. Type 2 (organization) NPI.
+// Medicaid pays this entity; the entity pays the doulas.
+model Organization {
+  id                 String   @id @default(cuid())
+  name               String
+  npi                String   @unique // Type 2 NPI
+  taxId              String // EIN
+  taxonomyCode       String // org-level taxonomy, verify per state
+  addressLine1       String
+  addressLine2       String?
+  city               String
+  state              String // org legal domicile, not enrollment scope
+  zip                String
+  contactEmail       String
+  contactPhone       String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  enrollments OrgEnrollment[]
+  doulas      Doula[]
+  claims      Claim[]
+}
+
+// State Medicaid enrollment is state-scoped, so the org's Medicaid provider
+// IDs live here, one row per state (and per payer where MCOs issue their own).
+model OrgEnrollment {
+  id                 String          @id @default(cuid())
+  organizationId     String
+  organization       Organization    @relation(fields: [organizationId], references: [id])
+  state              String
+  payerId            String?
+  payer              Payer?          @relation(fields: [payerId], references: [id])
+  medicaidProviderId String
+  effectiveDate      DateTime
+  status             EnrollmentStatus @default(PENDING)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  @@unique([organizationId, state, payerId])
+}
+
+enum EnrollmentStatus {
+  PENDING
+  ACTIVE
+  TERMINATED
+}
+
+// The rendering provider: an individual doula with a Type 1 NPI, operating
+// under the Organization.
+model Doula {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  firstName      String
+  lastName       String
+  email          String       @unique
+  phone          String?
+  npi            String       @unique // Type 1 NPI
+  taxonomyCode   String
+  state          String // state of practice
+  status         DoulaStatus  @default(ONBOARDING)
+  certifiedAt    DateTime? // state qualification/training completion
+  // Payout destination. Store only non-sensitive references; the full bank
+  // detail belongs in the payout rail's vault, not in this database.
+  payoutMethod   String? // e.g. "ACH"
+  payoutAccountRef String? // token/reference at the payout provider
+  feeBps         Int          @default(1500) // company fee in basis points (15%)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  clients  Client[]
+  episodes CareEpisode[]
+  services Service[]
+  claims   Claim[]
+  payouts  Payout[]
+  documents DoulaDocument[]
+}
+
+enum DoulaStatus {
+  ONBOARDING
+  ACTIVE
+  INACTIVE
+}
+
+// Credential and agreement documents. The file itself lives in object storage;
+// this row is the index and the access-control anchor.
+model DoulaDocument {
+  id         String   @id @default(cuid())
+  doulaId    String
+  doula      Doula    @relation(fields: [doulaId], references: [id])
+  kind       String // "TRAINING_CERTIFICATE" | "SIGNED_AGREEMENT" | "W9" | ...
+  fileName   String
+  storageKey String // key in the object store, server-side access only
+  uploadedAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Patients and coverage
+// ---------------------------------------------------------------------------
+
+model Client {
+  id           String    @id @default(cuid())
+  doulaId      String
+  doula        Doula     @relation(fields: [doulaId], references: [id])
+  firstName    String
+  lastName     String
+  dob          DateTime
+  medicaidId   String
+  state        String
+  planType     PlanType  @default(FFS)
+  payerId      String? // which MCO, when planType is MCO
+  payer        Payer?    @relation(fields: [payerId], references: [id])
+  addressLine1 String?
+  city         String?
+  zip          String?
+  phone        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  episodes          CareEpisode[]
+  eligibilityChecks EligibilityCheck[]
+
+  @@unique([medicaidId, state])
+}
+
+enum PlanType {
+  FFS
+  MCO
+}
+
+// Result of a 270/271 inquiry for a client on a date. Stored, never updated.
+model EligibilityCheck {
+  id              String            @id @default(cuid())
+  clientId        String
+  client          Client            @relation(fields: [clientId], references: [id])
+  checkedAt       DateTime          @default(now())
+  serviceDate     DateTime
+  status          EligibilityStatus
+  payerName       String?
+  coverageDetails Json? // structured summary from the 271
+  rawResponse     Json? // clearinghouse response, for audit
+}
+
+enum EligibilityStatus {
+  ACTIVE
+  INACTIVE
+  UNKNOWN
+  ERROR
+}
+
+// ---------------------------------------------------------------------------
+// Care delivery
+// ---------------------------------------------------------------------------
+
+// One pregnancy and its care arc for one client with one doula. Visit limits
+// in the StateRuleset are enforced per episode.
+model CareEpisode {
+  id                   String        @id @default(cuid())
+  clientId             String
+  client               Client        @relation(fields: [clientId], references: [id])
+  doulaId              String
+  doula                Doula         @relation(fields: [doulaId], references: [id])
+  expectedDeliveryDate DateTime?
+  actualDeliveryDate   DateTime?
+  status               EpisodeStatus @default(ACTIVE)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  services Service[]
+  claims   Claim[]
+}
+
+enum EpisodeStatus {
+  ACTIVE
+  COMPLETED
+  CLOSED
+}
+
+// A single billable event. Codes, modifiers, units, and charge are stamped
+// from the StateRuleset at validation time so the service is a frozen record
+// of what will go on the claim line.
+model Service {
+  id              String        @id @default(cuid())
+  episodeId       String
+  episode         CareEpisode   @relation(fields: [episodeId], references: [id])
+  doulaId         String // rendering provider
+  doula           Doula         @relation(fields: [doulaId], references: [id])
+  serviceType     ServiceType
+  serviceDate     DateTime
+  procedureCode   String? // stamped from ruleset
+  modifier        String?
+  units           Int           @default(1)
+  placeOfService  String? // POS code, stamped from ruleset
+  diagnosisCodes  String[] // ICD-10, stamped from ruleset default if empty
+  chargeCents     Int           @default(0)
+  status          ServiceStatus @default(LOGGED)
+  notes           String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  claimLines ClaimLine[]
+}
+
+enum ServiceType {
+  PRENATAL
+  LABOR_DELIVERY
+  POSTPARTUM
+}
+
+enum ServiceStatus {
+  LOGGED // entered by the doula, not yet validated
+  VALIDATED // passed ruleset validation, codes stamped
+  CLAIMED // on a built or submitted claim
+  PAID
+  DENIED
+}
+
+// ---------------------------------------------------------------------------
+// Claims
+// ---------------------------------------------------------------------------
+
+model Claim {
+  id                      String      @id @default(cuid())
+  claimNumber             String      @unique // internal patient control number (CLM01)
+  organizationId          String // billing provider
+  organization            Organization @relation(fields: [organizationId], references: [id])
+  renderingDoulaId        String
+  renderingDoula          Doula       @relation(fields: [renderingDoulaId], references: [id])
+  episodeId               String
+  episode                 CareEpisode @relation(fields: [episodeId], references: [id])
+  payerId                 String
+  payer                   Payer       @relation(fields: [payerId], references: [id])
+  status                  ClaimStatus @default(BUILT)
+  totalChargeCents        Int
+  totalPaidCents          Int         @default(0)
+  clearinghouseClaimId    String? // id assigned by the clearinghouse
+  payerClaimControlNumber String? // ICN from the payer
+  submittedAt             DateTime?
+  resubmissionOfId        String? // links a rework to the original claim
+  createdAt               DateTime    @default(now())
+  updatedAt               DateTime    @updatedAt
+
+  lines           ClaimLine[]
+  events          ClaimEvent[]
+  remittanceLines RemittanceLine[]
+}
+
+enum ClaimStatus {
+  BUILT
+  SUBMITTED
+  ACCEPTED // passed clearinghouse/payer front-end edits (999/277CA)
+  REJECTED // failed front-end edits, never adjudicated; fix and resubmit
+  PENDING // in adjudication
+  PAID
+  PARTIALLY_PAID
+  DENIED // adjudicated no; needs rework or appeal
+  REWORKING
+  VOID
+}
+
+model ClaimLine {
+  id              String          @id @default(cuid())
+  claimId         String
+  claim           Claim           @relation(fields: [claimId], references: [id])
+  serviceId       String
+  service         Service         @relation(fields: [serviceId], references: [id])
+  lineNumber      Int
+  procedureCode   String
+  modifier        String?
+  units           Int
+  chargeCents     Int
+  allowedCents    Int?
+  paidCents       Int             @default(0)
+  adjustmentCents Int             @default(0)
+  denialCodes     String[] // CARC codes from the 835
+  remarkCodes     String[] // RARC codes from the 835
+  status          ClaimLineStatus @default(SUBMITTED)
+
+  remittanceLines RemittanceLine[]
+  payoutLines     PayoutLine[]
+
+  @@unique([claimId, lineNumber])
+}
+
+enum ClaimLineStatus {
+  SUBMITTED
+  PAID
+  DENIED
+  ADJUSTED
+}
+
+// Every status transition and external response, append-only. This is the
+// claim's audit trail and the debugging surface for payer quirks.
+model ClaimEvent {
+  id         String      @id @default(cuid())
+  claimId    String
+  claim      Claim       @relation(fields: [claimId], references: [id])
+  fromStatus ClaimStatus?
+  toStatus   ClaimStatus
+  source     EventSource
+  message    String?
+  raw        Json? // raw clearinghouse/payer payload
+  createdAt  DateTime    @default(now())
+}
+
+enum EventSource {
+  SYSTEM
+  USER
+  CLEARINGHOUSE
+  PAYER
+}
+
+// ---------------------------------------------------------------------------
+// Remittance (835)
+// ---------------------------------------------------------------------------
+
+model RemittanceAdvice {
+  id               String   @id @default(cuid())
+  payerId          String
+  payer            Payer    @relation(fields: [payerId], references: [id])
+  remitDate        DateTime
+  checkOrEftNumber String // TRN02; the reconciliation key against bank deposits
+  totalPaidCents   Int
+  raw              Json? // full structured 835 from the clearinghouse
+  reconciledAt     DateTime? // set when matched to a bank deposit
+  createdAt        DateTime @default(now())
+
+  lines RemittanceLine[]
+
+  @@unique([payerId, checkOrEftNumber])
+}
+
+model RemittanceLine {
+  id                  String           @id @default(cuid())
+  remittanceId        String
+  remittance          RemittanceAdvice @relation(fields: [remittanceId], references: [id])
+  claimId             String
+  claim               Claim            @relation(fields: [claimId], references: [id])
+  claimLineId         String
+  claimLine           ClaimLine        @relation(fields: [claimLineId], references: [id])
+  paidCents           Int
+  allowedCents        Int?
+  adjustmentCents     Int              @default(0)
+  adjustmentGroupCode String? // CO, PR, OA, PI
+  reasonCodes         String[] // CARC
+  remarkCodes         String[] // RARC
+}
+
+// ---------------------------------------------------------------------------
+// Payouts
+// ---------------------------------------------------------------------------
+
+// What the organization owes a doula for paid claim lines. The ledger is
+// independent of the payout rail: PayoutLine rows are the source of truth,
+// the rail reference is just execution metadata.
+model Payout {
+  id          String       @id @default(cuid())
+  doulaId     String
+  doula       Doula        @relation(fields: [doulaId], references: [id])
+  grossCents  Int
+  feeCents    Int
+  netCents    Int
+  status      PayoutStatus @default(PENDING)
+  railRef     String? // ACH/payment-platform transaction reference
+  approvedAt  DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  lines PayoutLine[]
+}
+
+enum PayoutStatus {
+  PENDING
+  APPROVED
+  PAID
+  FAILED
+}
+
+model PayoutLine {
+  id          String    @id @default(cuid())
+  payoutId    String
+  payout      Payout    @relation(fields: [payoutId], references: [id])
+  claimLineId String    @unique // a paid claim line is paid out exactly once
+  claimLine   ClaimLine @relation(fields: [claimLineId], references: [id])
+  grossCents  Int
+  feeCents    Int
+  netCents    Int
+}
+
+// ---------------------------------------------------------------------------
+// Per-state rules engine
+// ---------------------------------------------------------------------------
+
+// A payer the system can bill: a state's FFS Medicaid program or an MCO.
+model Payer {
+  id                   String    @id @default(cuid())
+  name                 String
+  state                String
+  payerType            PayerType
+  // The payer ID used on claims and for clearinghouse routing. Verify against
+  // the chosen clearinghouse's payer list before go-live.
+  externalPayerId      String
+  clearinghousePayerCode String?
+  createdAt            DateTime  @default(now())
+
+  rulesets      StateRuleset[]
+  claims        Claim[]
+  remittances   RemittanceAdvice[]
+  clients       Client[]
+  enrollments   OrgEnrollment[]
+
+  @@unique([state, externalPayerId])
+}
+
+enum PayerType {
+  MEDICAID_FFS
+  MCO
+}
+
+// The per-state configuration the claim builder and validator read from.
+// Adding a state means authoring one of these plus its ServiceCodeRules and
+// Payers, not writing new code.
+model StateRuleset {
+  id            String   @id @default(cuid())
+  state         String
+  version       Int
+  effectiveDate DateTime
+  active        Boolean  @default(false)
+  // Default diagnosis codes when a service does not specify its own.
+  defaultDiagnosisCodes String[]
+  defaultPlaceOfService String // POS code
+  // Free-form notes: companion-guide citations, enrollment requirements.
+  notes         String?
+  // Default FFS payer for the state. Clients on an MCO override per client.
+  defaultPayerId String?
+  defaultPayer   Payer?  @relation(fields: [defaultPayerId], references: [id])
+  createdAt     DateTime @default(now())
+
+  codeRules ServiceCodeRule[]
+
+  @@unique([state, version])
+}
+
+// One row per billable service type in a state: the code, modifier, units,
+// rate, and limits, sourced from the state fee schedule and billing manual.
+model ServiceCodeRule {
+  id                  String       @id @default(cuid())
+  rulesetId           String
+  ruleset             StateRuleset @relation(fields: [rulesetId], references: [id])
+  serviceType         ServiceType
+  procedureCode       String // HCPCS, often a T-code; verify per state
+  modifier            String?
+  unitsPerVisit       Int          @default(1)
+  rateCents           Int // fee-schedule rate per unit
+  maxVisitsPerEpisode Int? // null = no limit
+  placeOfService      String? // overrides ruleset default when set
+  allowedDiagnosisCodes String[] // empty = use ruleset default
+  requiresDeliveryDate Boolean    @default(false) // e.g. labor/delivery support
+
+  @@unique([rulesetId, serviceType, procedureCode])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+// Append-only. Application code must never update or delete rows here.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorType  String // "USER" | "DOULA" | "SYSTEM" | "WEBHOOK"
+  actorId    String?
+  action     String // "CREATE" | "UPDATE" | "STATUS_CHANGE" | "SUBMIT" | ...
+  entityType String
+  entityId   String
+  detail     Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
