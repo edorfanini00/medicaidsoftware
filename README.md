@@ -55,6 +55,17 @@ Open http://localhost:3000. With `CLEARINGHOUSE=mock` you can exercise the full 
 | `POST /api/payouts` | Generate payouts from paid lines |
 | `POST /api/payouts/:id/mark-paid` | Record rail execution |
 
+## Deploying to Vercel
+
+The app queries Postgres on every page, so a deployment without a database serves errors. Required steps:
+
+1. In the Vercel dashboard: project, Storage tab, Create Database, pick a Postgres provider (Neon free tier works). Accepting the defaults injects `DATABASE_URL` into the project's environment variables automatically.
+2. Set `CLEARINGHOUSE=mock` in the project's environment variables (until a real clearinghouse adapter is implemented).
+3. Redeploy. The build runs `prisma migrate deploy`, which creates the schema.
+4. Seed once from your machine against the hosted database: `vercel env pull .env.production.local && DATABASE_URL=$(grep DATABASE_URL .env.production.local | cut -d'"' -f2) npx prisma db seed`
+
+Do not put real client data (PHI) on a standard Vercel plan; HIPAA requires a BAA with the hosting provider, which Vercel only offers on enterprise agreements.
+
 ## Before billing real claims (do not skip)
 
 The seed data is EXAMPLE data. Specifics in this repo that must be verified against primary sources before production:
